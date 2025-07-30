@@ -15,12 +15,52 @@ import {
   useDisclosure
 } from '@chakra-ui/react';
 import { FaDownload, FaEdit } from 'react-icons/fa';
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import dynamic from 'next/dynamic';
 import NextLink from 'next/link';
 import crypto from 'crypto';
 
 const Editor = dynamic(() => import('./editor'), { ssr: false });
+
+function analyzeSaveFile(data, password) {
+  if (!data) return null;
+  
+  const isGzipped = isGzip(data);
+  const isJsonData = isJSON(data);
+  
+  // If it's already JSON, it's unencrypted
+  if (isJsonData) {
+    return { encrypted: false, gzipped: false, status: 'Unencrypted JSON' };
+  }
+  
+  // If it starts with gzip magic bytes, it's compressed
+  if (isGzipped) {
+    return { encrypted: false, gzipped: true, status: 'GZip compressed only' };
+  }
+  
+  // If we have a password, assume it's encrypted
+  if (password) {
+    // Try to decrypt and see if result is gzipped
+    try {
+      const iv = data.subarray(0, 16);
+      const decipher = crypto.createDecipheriv('aes-128-cbc', crypto.pbkdf2Sync(password, iv, 100, 16, 'sha1'), iv);
+      const decrypted = Buffer.concat([decipher.update(data.subarray(16)), decipher.final()]);
+      
+      if (isGzip(decrypted)) {
+        return { encrypted: true, gzipped: true, status: 'Encrypted + GZip compressed' };
+      } else if (isJSON(decrypted)) {
+        return { encrypted: true, gzipped: false, status: 'Encrypted only' };
+      } else {
+        return { encrypted: true, gzipped: false, status: 'Encrypted (unknown format)' };
+      }
+    } catch (e) {
+      return { encrypted: true, gzipped: false, status: 'Encrypted (wrong password?)' };
+    }
+  }
+  
+  // Unknown format
+  return { encrypted: false, gzipped: false, status: 'Unknown format' };
+}
 
 function isGzip(data) {
   return data[0] == 0x1F && data[1] == 0x8B;
@@ -93,12 +133,21 @@ export default function CryptForm({ isEncryption, isLoading, setIsLoading, passw
   const toast = useToast();
   const saveFileRef = useRef();
   const [data, setData] = useState(null);
+  const [saveStatus, setSaveStatus] = useState(null);
   const [editorData, setEditorData] = useState(null);
   const [shouldGzip, setShouldGzip] = useState(false);
   const [lastFileName, setLastFileName] = useState(null);
   const [isEncryptionWarning, setIsEncryptionWarning] = useState(false);
   const { isOpen, onOpen: _onOpen, onClose: _onClose } = useDisclosure();
   const { isOpen: isEditorOpen, onOpen: onEditorOpen, onClose: onEditorClose } = useDisclosure();
+
+  // Re-analyze when password changes
+  useEffect(() => {
+    if (!isEncryption && data) {
+      const analysis = analyzeSaveFile(data, password);
+      setSaveStatus(analysis);
+    }
+  }, [password, data, isEncryption]);
 
   const onOpen = (encryption) => {
     if (encryption)
@@ -142,6 +191,7 @@ export default function CryptForm({ isEncryption, isLoading, setIsLoading, passw
 
             if (!files.length) {
               setData(null);
+              setSaveStatus(null);
               return;
             }
 
@@ -162,8 +212,34 @@ export default function CryptForm({ isEncryption, isLoading, setIsLoading, passw
             const file = files[0];
             setLastFileName(file.name);
             fileReader.readAsArrayBuffer(file);
+            
+            // Analyze the file after it's loaded
+            fileReader.onload = loadEvent => {
+              const fileData = Buffer.from(loadEvent.target.result);
+              setData(fileData);
+              
+              if (!isEncryption) {
+                const analysis = analyzeSaveFile(fileData, password);
+                setSaveStatus(analysis);
+              }
+            };
           }}
         />
+        
+        {!isEncryption && data && (
+          <Text 
+            mt='2' 
+            fontSize='sm' 
+            color={
+              saveStatus?.status.includes('wrong password') ? 'red.400' :
+              saveStatus?.status.includes('Unknown') ? 'yellow.400' :
+              'green.400'
+            }
+          >
+            Status: {saveStatus?.status || 'Analyzing...'}
+          </Text>
+        )}
+        
         {isEncryption && (
           <Checkbox
             disabled={isLoading}
